@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "fire>=0.7.1",
+    "langchain-text-splitters>=1.1.2",
     "mypy>=2.3.1",
     "pydantic>=2.13.5",
 ]
