@@ -9,3 +9,4 @@ class MinimalSource(BaseModel):
 class Chunk(BaseModel):
     source: MinimalSource
     text: str
+    metadata: dict
