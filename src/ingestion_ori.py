@@ -109,7 +109,7 @@ class Markdown:
             def add_chunk() -> None:
                 if content:
                     raw_text: str = "".join(content)
-                    stripped: str = raw_text.strip()
+                    stripped: str = raw_text.lstrip()
                     if stripped:
                         lstrip_len: int = len(raw_text) - len(raw_text.lstrip())
                         start_char: int = section_start + lstrip_len
