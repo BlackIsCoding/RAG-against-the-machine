@@ -42,7 +42,7 @@ class Header():
         self.chunks: list[dict] = []
 
         for doc in docs_files:
-            if doc.endswith(".md"):
+            if str(doc).endswith(".md") or str(doc).endswith(".txt"):
                 headers: dict[str, int] | None = {}
                 content: list[str] = []
                 offset = 0
