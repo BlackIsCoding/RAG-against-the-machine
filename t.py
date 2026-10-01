@@ -1,17 +1,9 @@
-import os
-import sys
+class helo():
+    def hello():
+        print("abcd. ")
 
-x = 10
-
-def hello(name):
-    print(name)
-
-class Person:
-    def __init__(self, name):
-        self.name = name
-
-    def say_hello(self):
-        print(self.name)
-
-def goodbye():
-    print("bye")
+    def test():
+        print(111)
+        if (a ==5):
+            print(2)
+            sceefef4

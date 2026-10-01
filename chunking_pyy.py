@@ -14,7 +14,8 @@ class Python():
         chunk = {"file_path": file, "first_char": first_char,
                  "last_char": first_char + len(chunk_content),
                  "text": chunk_content,
-                 "type": node_type}
+                 "type": node_type,
+                 "node": node}
         return chunk
 
     def split_toplvl(self):
@@ -69,7 +70,7 @@ class Python():
                         text,
                         current_group[0]['file_path'],
                         first,
-                        None
+                        current_group[0]['node']
                     )
 
                     merged_chunks.append(merged)
@@ -91,7 +92,7 @@ class Python():
                 text,
                 current_group[0]['file_path'],
                 first,
-                None
+                current_group[0]['node']
             )
 
             merged_chunks.append(merged)
@@ -99,26 +100,226 @@ class Python():
         self.chunks = merged_chunks
         return merged_chunks
 
+    def split_internals(self):
+        updated_chunks = []
+        for chunk in self.chunks:
+            if len(chunk['text']) <= self.max_size:
+                updated_chunks.append(chunk)
+            else:
+                children = chunk['node'].body
+                for child in children:
+                    with open(chunk['file_path']) as f:
+                        content = f.read()
+                        chunk_content = ast.get_source_segment(content, child)
+                        u_chunk = self.add_chunk(chunk_content, chunk['file_path'], chunk['first_char'], child)
+                        u_chunk['parent'] =[chunk['node']]
+                        if isinstance(chunk['node'], ast.FunctionDef):
+                            u_chunk['hierarchy'] = [f"def {chunk['node'].name}"]
+                        elif isinstance(chunk['node'], ast.ClassDef):
+                            u_chunk['hierarchy'] = [f"class {chunk['node'].name}"]
+                        if isinstance(child, ast.FunctionDef):
+                            u_chunk['hierarchy'] += [f"def {child.name}"]
+                        elif isinstance(child, ast.ClassDef):
+                            u_chunk['hierarchy'] += [f"class {child.name}"]
+                        u_chunk['identity'] = child
+                        updated_chunks.append(u_chunk)
+        self.chunks = updated_chunks
+        return updated_chunks
+
+    # def split_para(self):
+    #     chunks = []
+
+    #     for chunk in self.chunks:
+    #         c_content = chunk['text']
+    #         if len(c_content) <= self.max_size:
+    #             chunks.append(chunk)
+    #             continue
+    #         paragraphs = c_content.split("\n\n")
+    #         if not isinstance(paragraphs, list):
+    #             continue
+    #         find_position = 0
+    #         for para in paragraphs:
+    #             para = para.strip()
+    #             if not para:
+    #                 continue
+    #             real_start = c_content.find(para, find_position)
+    #             find_position = real_start + len(para)
+
+    #             chunkk = self.add_chunk(para, chunk['file_path'], real_start, chunk['node'])
+    #             if 'parent' in chunk:
+    #                 chunkk['parent'] = [chunk['parent']]
+    #                 chunkk['parent'].append(chunk['identity'])
+    #             chunks.append(chunkk)
+    #     self.chunks = chunks
+    #     return chunks
+
+    def split_lines(self):
+        chunks = []
+
+        for chunk in self.chunks:
+            c_content = chunk['text']
+
+            if len(c_content) <= self.max_size:
+                chunks.append(chunk)
+                continue
+
+            lines = c_content.splitlines(keepends=True)
+
+            current_lines = []
+            current_size = 0
+            sub_chunk_start = chunk['first_char']
+
+            for line in lines:
+                if not line.strip():
+                    continue
+                line_len = len(line)
+
+                # Adding this line would exceed max_size
+                if current_size + line_len > self.max_size and current_lines:
+
+                    join_lines = ''.join(current_lines)
+
+                    chunkk = {
+                        "file_path": chunk['file_path'],
+                        "first_char": sub_chunk_start,
+                        "last_char": sub_chunk_start + len(join_lines),
+                        "text": join_lines,
+                        "type": chunk['type'],
+                        "node": chunk['node']
+                    }
+
+                    # Preserve hierarchy information
+                    if 'parent' in chunk:
+                        chunkk['parent'] = chunk['parent'] + [chunk['identity']]
+                        chunkk['hierarchy'] = chunk['hierarchy']
 
 
+                    chunks.append(chunkk)
 
+                    # Next chunk starts immediately after this one
+                    sub_chunk_start += len(join_lines)
 
+                    current_lines = [line]
+                    current_size = line_len
 
+                else:
+                    current_lines.append(line)
+                    current_size += line_len
 
+            # Add the final group
+            if current_lines:
+                join_lines = ''.join(current_lines)
 
+                chunkk = {
+                    "file_path": chunk['file_path'],
+                    "first_char": sub_chunk_start,
+                    "last_char": sub_chunk_start + len(join_lines),
+                    "text": join_lines,
+                    "type": chunk['type'],
+                    "node": chunk['node']
+                }
+                if 'parent' in chunk:
+                    chunkk['parent'] = chunk['parent'] + [chunk['identity']]
+                    chunkk['hierarchy'] = chunk['hierarchy']
+                    # Inside split_lines, replace the hierarchy assignment logic with:
 
+                chunks.append(chunkk)
 
+        self.chunks = chunks
+        return chunks
 
+    def split_sentence(self):
+        chunks = []
+        checkpoint_chars = ".!?…;:, \t"
 
+        for chunk in self.chunks:
+            content = chunk["text"]
 
+            if len(content) <= self.max_size:
+                chunks.append(chunk)
+                continue
 
+            chars_hub = ""
+            chunk_start = chunk["first_char"]
+            line_length = 0
+            checkpoint = None
+
+            for char in content:
+                chars_hub += char
+                line_length += 1
+
+                if char in checkpoint_chars:
+                    checkpoint = line_length
+
+                if line_length == self.max_size:
+
+                    if checkpoint is not None:
+                        piece = chars_hub[:checkpoint]
+
+                        chunkk = self.add_chunk(
+                            piece,
+                            chunk['file_path'],
+                            chunk_start,
+                            chunk['node']
+                        )
+
+                        if 'parent' in chunk:
+                            chunkk['parent'] = chunk['parent']
+
+                        chunks.append(chunkk)
+
+                        chars_hub = chars_hub[checkpoint:]
+                        chunk_start += checkpoint
+                        line_length -= checkpoint
+
+                    else:
+                        chunkk = self.add_chunk(
+                            chars_hub,
+                            chunk['file_path'],
+                            chunk_start,
+                            chunk['node']
+                        )
+
+                    if 'parent' in chunk:
+                        chunkk['parent'] = chunk['parent']
+                        chunkk['hierarchy'] = chunk['hierarchy']
+
+                        chunks.append(chunkk)
+
+                        chunk_start += line_length
+                        chars_hub = ""
+                        line_length = 0
+
+                    checkpoint = None
+
+            if chars_hub:
+                chunkk = self.add_chunk(
+                    chars_hub,
+                    chunk['file_path'],
+                    chunk_start,
+                    chunk['node']
+                )
+
+                if 'parent' in chunk:
+                    chunkk['parent'] = chunk['parent']
+                    chunkk['hierarchy'] = chunk['hierarchy']
+
+                chunks.append(chunkk)
+
+        self.chunks = chunks
+        return chunks
 
 
 file = "t.py"
-pyt = Python([file], 100)
+pyt = Python([file], 1)
 chunks = pyt.split_toplvl()
 chunks = pyt.merge_toplvl()
-
+chunks = pyt.split_internals()
+# chunks = pyt.split_para()
+chunks = pyt.split_lines()
+chunks = pyt.split_sentence()
 for ch in chunks:
+    if ch.get('hierarchy', 0):
+        print(ch['hierarchy'])
     print(ch)
     print()
