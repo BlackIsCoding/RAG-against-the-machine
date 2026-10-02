@@ -6,6 +6,7 @@ try:
     from .chunking_pyy import Python
     import json
     import fire
+    import time
 except Exception as e:
     print("Module level:", e)
     exit(1)
@@ -25,18 +26,25 @@ def index(max_chunk_size = 2000, query=''):
 
     py_files = ingester.find_python_files()
     py_parser = Python(py_files, max_chunk_size)
+
+    start = time.perf_counter()
     py_parser.split_toplvl()
-    print("finish")
+    print("python toplvl", time.perf_counter() - start)
+    start = time.perf_counter()
     py_parser.merge_toplvl()
-    print(2)
+    print("merge toplvl", time.perf_counter() - start)
+    start = time.perf_counter()
     py_parser.split_internals()
-    print(3)
-    print("finish 2")
+    print("split internals", time.perf_counter() - start)
+    start = time.perf_counter()
     py_parser.split_lines()
-    print(4)
+    print("split lines", time.perf_counter() - start)
+    start = time.perf_counter()
     py_parser.split_sentence()
-    print(5)
+    print("python split sentence", time.perf_counter() - start)
+    start = time.perf_counter()
     chunks += py_parser.chunks_adapt()
+    print("python adapting", time.perf_counter() - start)
             
     objected_chunks = ingester.saving_chunks(chunks)
 
