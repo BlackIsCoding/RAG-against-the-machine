@@ -3,7 +3,7 @@ try:
     from .ingest import Ingester
     from .index import Indexer
     from .markdown import Header
-    from .python_ch_paragraph import PythonStructuralChunker
+    from .chunking_pyy import Python
     import json
     import fire
 except Exception as e:
@@ -12,6 +12,7 @@ except Exception as e:
 
 
 def index(max_chunk_size = 2000, query=''):
+    print(1)
     ingester = Ingester("data/raw/vllm-0.10.1")
     md = ingester.find_txt_files()
     md += ingester.find_md_files()
@@ -23,23 +24,19 @@ def index(max_chunk_size = 2000, query=''):
     chunks = md_parser.split_sentence()
 
     py_files = ingester.find_python_files()
-    for file_path in py_files:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                code_content = f.read()
-            
-            chunker = PythonStructuralChunker(file_path, code_content, max_chunk_size=max_chunk_size)
-            py_chunks = chunker.chunk_file()
-            
-            # Convert Python dictionary metadata into a list of strings to match Markdown chunk expectations
-            for chunk in py_chunks:
-                meta = chunk.get("metadata", {})
-                if isinstance(meta, dict):
-                    chunk["metadata"] = [f"{k} -> {v}" for k, v in meta.items()]
-            
-            chunks.extend(py_chunks)
-        except Exception as e:
-            print(f"Error parsing python file {file_path}: {e}")
+    py_parser = Python(py_files, max_chunk_size)
+    py_parser.split_toplvl()
+    print("finish")
+    py_parser.merge_toplvl()
+    print(2)
+    py_parser.split_internals()
+    print(3)
+    print("finish 2")
+    py_parser.split_lines()
+    print(4)
+    py_parser.split_sentence()
+    print(5)
+    chunks += py_parser.chunks_adapt()
             
     objected_chunks = ingester.saving_chunks(chunks)
 

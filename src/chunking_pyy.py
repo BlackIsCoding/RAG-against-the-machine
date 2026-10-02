@@ -19,25 +19,49 @@ class Python():
         return chunk
 
     def split_toplvl(self):
-        chunks = []
-        
-        for file in self.python_files:
-            find_index = 0
-            
-            with open(file) as f:
-                content = f.read()
+            chunks = []
+
+            i = 0
+            for file in self.python_files:
+                print(i)
+                i += 1
+                find_index = 0
                 
-                if len(content) <= self.max_size:
-                    chunking = self.add_chunk(content, file, find_index, None)
-                    chunks.append(chunking)
-                else:
-                    tree = ast.parse(content)
-                    for node in tree.body:
-                        chunk = self.add_chunk(ast.get_source_segment(content, node), file, find_index, node)
-                        find_index = chunk['last_char']
-                        chunks.append(chunk)
-        self.chunks = chunks
-        return chunks
+                try:
+                    # Use errors='ignore' to prevent decoding crashes on random files
+                    with open(file, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        
+                    if not content.strip():
+                        continue
+                        
+                    if len(content) <= self.max_size:
+                        chunking = self.add_chunk(content, file, find_index, None)
+                        chunks.append(chunking)
+                    else:
+                        try:
+                            # Attempt AST parsing for valid structural chunks
+                            tree = ast.parse(content, filename=file)
+                            for node in tree.body:
+                                segment = ast.get_source_segment(content, node)
+                                if segment:
+                                    chunk = self.add_chunk(segment, file, find_index, node)
+                                    find_index = chunk['last_char']
+                                    chunks.append(chunk)
+                                    
+                        except SyntaxError:
+                            # FALLBACK: If the file uses newer Python features (like backslashes 
+                            # in f-strings) that your current Python interpreter doesn't support,
+                            # gracefully treat the whole file as a raw text chunk without crashing.
+                            chunking = self.add_chunk(content, file, find_index, None)
+                            chunks.append(chunking)
+                            
+                except Exception as e:
+                    print(f"Skipping file {file} due to error: {e}")
+                    continue
+                    
+            self.chunks = chunks
+            return chunks
 
     def merge_toplvl(self):
         current_chunks = self.chunks
@@ -49,8 +73,8 @@ class Python():
         while index < len(current_chunks):
             chunk = current_chunks[index]
             current_size = chunk['last_char'] - chunk['first_char']
-
-            if group_size + current_size <= self.max_size:
+            same_file = same_file = not current_group or current_group[0]['file_path'] == chunk['file_path']
+            if same_file and (group_size + current_size <= self.max_size):
                 current_group.append(chunk)
                 group_size += current_size
                 index += 1
@@ -102,8 +126,12 @@ class Python():
 
     def split_internals(self):
         updated_chunks = []
+        print(len(self.chunks))
+        i = 0
         for chunk in self.chunks:
-            if len(chunk['text']) <= self.max_size:
+            i += 1
+            if len(chunk['text']) <= self.max_size or not hasattr(
+                chunk['node'], 'body') or chunk['node'] is None:
                 updated_chunks.append(chunk)
             else:
                 children = chunk['node'].body
@@ -113,6 +141,7 @@ class Python():
                         chunk_content = ast.get_source_segment(content, child)
                         u_chunk = self.add_chunk(chunk_content, chunk['file_path'], chunk['first_char'], child)
                         u_chunk['parent'] =[chunk['node']]
+                        u_chunk['hierarchy'] = []
                         if isinstance(chunk['node'], ast.FunctionDef):
                             u_chunk['hierarchy'] = [f"def {chunk['node'].name}"]
                         elif isinstance(chunk['node'], ast.ClassDef):
@@ -309,17 +338,40 @@ class Python():
         self.chunks = chunks
         return chunks
 
+    def chunks_adapt(self):
+        chunks = self.chunks
+        new = []
 
-file = "t.py"
-pyt = Python([file], 1)
-chunks = pyt.split_toplvl()
-chunks = pyt.merge_toplvl()
-chunks = pyt.split_internals()
-# chunks = pyt.split_para()
-chunks = pyt.split_lines()
-chunks = pyt.split_sentence()
-for ch in chunks:
-    if ch.get('hierarchy', 0):
-        print(ch['hierarchy'])
-    print(ch)
-    print()
+        for chunk in chunks:
+            keys = list(chunk.keys())
+
+            new_chunk = {}
+            for key in keys:
+                if key == 'text':
+                    new_chunk['content'] = chunk[key]
+                elif key == 'first_char':
+                    new_chunk['start_char'] = chunk[key]
+                elif key == 'last_char':
+                    new_chunk['end_char'] = chunk[key]
+                elif key == 'hierarchy':
+                    new_chunk['metadata'] = chunk['hierarchy']
+                else:
+                    new_chunk[key] = chunk[key]
+            if 'metadata' not in new_chunk:
+                new_chunk['metadata'] = []
+            new.append(new_chunk)
+        return new
+
+# file = "t.py"
+# pyt = Python([file], 50)
+# chunks = pyt.split_toplvl()
+# chunks = pyt.merge_toplvl()
+# chunks = pyt.split_internals()
+# # chunks = pyt.split_para()
+# chunks = pyt.split_lines()
+# chunks = pyt.split_sentence()
+# for ch in chunks:
+#     if ch.get('hierarchy', 0):
+#         print(ch['hierarchy'])
+#     print(ch)
+#     print()
