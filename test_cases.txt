@@ -1,0 +1,4 @@
+# Cache :
+1-if no try/except on load, crush on empty file
+2-if cache of index is in a different dir than processed when deleted processed it will raise an error
+3-the cache should depend on the class indexer content as well

@@ -49,15 +49,20 @@ def index(max_chunk_size = 2000, query=''):
     objected_chunks = ingester.saving_chunks(chunks)
 
     indexer = Indexer(objected_chunks)
-    indexer.indexing_chunks()
-    if not query:
-        with open("data/datasets/public/AnsweredQuestions/dataset_docs_public.json") as f:
-            questions = json.load(f)
-        indexer.evaluate_all(questions['rag_questions'], 5)
-        with open("data/datasets/public/AnsweredQuestions/dataset_code_public.json") as f:
-            questions = json.load(f)
-        indexer.evaluate_all(questions['rag_questions'], 5)
-    else:
-        indexer.search(query, 5)
+    indexer.bm25s_indexing()
+    
+    # start = time.perf_counter()
+    # indexer.encode_chunks()
+    # print("encoding chunks:", time.perf_counter() - start)
+
+    # if not query:
+    #     with open("data/datasets/public/AnsweredQuestions/dataset_docs_public.json") as f:
+    #         questions = json.load(f)
+    #     indexer.evaluate_dataset(questions['rag_questions'], 5)
+    #     with open("data/datasets/public/AnsweredQuestions/dataset_code_public.json") as f:
+    #         questions = json.load(f)
+    #     indexer.evaluate_dataset(questions['rag_questions'], 5)
+    # else:
+    #     indexer.fusion(query, 5)
 
 fire.Fire({"index": index})

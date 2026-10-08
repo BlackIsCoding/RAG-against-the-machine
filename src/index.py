@@ -2,26 +2,37 @@ from .pyd_models import Chunk, MinimalSource
 from pathlib import Path
 import Stemmer
 import bm25s
-
-def compute_iou(a: tuple[int, int], b: tuple[int, int]) -> float:
-    """Compute intersection-over-union between two [start, end) ranges."""
-    a_start, a_end = a
-    b_start, b_end = b
-
-    intersection: int = max(0, min(a_end, b_end) - max(a_start, b_start))
-    union: int = (a_end - a_start) + (b_end - b_start) - intersection
-
-    if union == 0:
-        return 0.0
-
-    return intersection / union
+import sentence_transformers
+import numpy as np
 
 class Indexer():
     def __init__(self, chunks: list[Chunk]):
         self.chunks = chunks
         self.saving_path = Path("data/processed/")
+        self.model = sentence_transformers.SentenceTransformer("all-MiniLM-L6-v2")
 
-    def indexing_chunks(self):
+    def encode_chunks(self):
+        gather = []
+        batch_size = 32
+
+        for i in range(0, len(self.chunks), batch_size):
+            batch = [chunk.text for chunk in self.chunks[i:i + batch_size]]
+
+            res = self.model.encode(
+                batch,
+                normalize_embeddings=True
+            )
+
+            gather.extend(res)
+
+            print(
+                f"Encoded {min(i + batch_size, len(self.chunks))}"
+                f"/{len(self.chunks)} chunks"
+            )
+
+        self.encoded_chunks = np.array(gather)
+
+    def bm25s_indexing(self):
         for chunk in self.chunks:
             text = ''
             for i, m in enumerate(chunk.metadata):
@@ -42,7 +53,14 @@ class Indexer():
         retriever.save(self.saving_path)
         print(f"BM25 index successfully built and saved to {self.saving_path}")
 
-    def search(self, query: str, top_k: int = 5):
+    def semantic_search(self, query, top_k):
+        model = self.model
+        query = model.encode(query, normalize_embeddings=True)
+        similarity = self.encoded_chunks @ query
+        top_results = similarity.argsort()[::-1][:top_k]
+        return top_results, similarity[top_results]
+
+    def lexical_search(self, query: str, top_k: int = 5):
         """Load the BM25 index, query it, and map row IDs back to your in-memory chunks."""
         if not self.saving_path.exists():
             raise FileNotFoundError(f"Index not found at {self.saving_path}. Run 'index' first!")
@@ -51,81 +69,138 @@ class Indexer():
         stemmer = Stemmer.Stemmer("english")
         query_tokens = bm25s.tokenize([query], stemmer=stemmer)
         results, scores = retriever.retrieve(query_tokens, k=top_k)
-        print(f"\nQuery: '{query}'")
-        print("=" * 40)
+        results = results[0]
+        scores = scores[0]
+        return results, scores
 
-        self.last_results: list[Chunk] = []
+    def rescale_vectors(self, scores):
+        scores = np.array(scores)
+        maxi = max(scores)
+        mini = min(scores)
 
-        for i in range(results.shape[1]):
-            doc_idx = results[0, i]
-            score = scores[0, i]
-            
-            matched_chunk: Chunk = self.chunks[doc_idx]
-            self.last_results.append(matched_chunk)
-            source: MinimalSource = matched_chunk.source
-            
-            print(f"Rank {i+1} (Score: {score:.2f})")
-            print(f"  File Path: {source.file_path}")
-            print(f"  Character Range: {source.first_character_index} - {source.last_character_index}")
-            print(f"  Snippet: {matched_chunk.text}...\n")
+        if maxi == mini:
+            return np.zeros_like(scores)
 
-    def evaluate_all(self, questions: list[dict], top_k: int = 5) -> None:
-        threshold = 0.05
+        return (scores - mini) / (maxi - mini)
+
+    def map_chunks(self, query, top_k):
+        semantic_res = self.semantic_search(query, top_k)
+        lexical_res = self.lexical_search(query, top_k)
+
+        semantic_dict = {}
+        for i, s in enumerate(semantic_res[0]):
+            semantic_dict[s] = semantic_res[1][i]
+
+        lexical_dict = {}
+        for i, s in enumerate(lexical_res[0]):
+            lexical_dict[s] = lexical_res[1][i]
+
+        return semantic_dict, lexical_dict
+
+    def fusion(self, query, top_k):
+        semantic_dict, lexical_dict = self.map_chunks(query, top_k)
+        combined = set(semantic_dict) | set(lexical_dict)
+
+        semantic_scores = self.rescale_vectors(list(semantic_dict.values()))
+        lexical_scores = self.rescale_vectors(list(lexical_dict.values()))
+
+        brandnew_semantic = {}
+        for i, s in enumerate(semantic_dict):
+            brandnew_semantic[s] = semantic_scores[i]
+
+        brandnew_lexical = {}
+        for i ,s in enumerate(lexical_dict):
+            brandnew_lexical[s] = lexical_scores[i]
+
+        brandnew_ranking = {}
+        for c in combined:
+            hybrid_score = 0.5 * brandnew_semantic.get(
+                c, 0 ) + 1.5 * brandnew_lexical.get(c, 0)
+            brandnew_ranking[c] = hybrid_score
+
+        top_results = sorted(brandnew_ranking.items(),key=lambda x: x[1],
+                             reverse=True)[:top_k]
+        return top_results
+
+
+    def source_overlap(self, retrieved, ground_truth):
+        if retrieved.file_path != ground_truth["file_path"]:
+            return 0.0
+
+        intersection_start = max(
+            retrieved.first_character_index,
+            ground_truth["first_character_index"]
+        )
+
+        intersection_end = min(
+            retrieved.last_character_index,
+            ground_truth["last_character_index"]
+        )
+
+        intersection = max(
+            0,
+            intersection_end - intersection_start
+        )
+
+        retrieved_length = (
+            retrieved.last_character_index
+            - retrieved.first_character_index
+        )
+
+        ground_truth_length = (
+            ground_truth["last_character_index"]
+            - ground_truth["first_character_index"]
+        )
+
+        union = retrieved_length + ground_truth_length - intersection
+
+        if union <= 0:
+            return 0.0
+
+        return intersection / union
+
+
+    def evaluate_dataset(self, questions, top_k=5):
         passed = 0
 
-        for number, question in enumerate(questions, start=1):
+        for question in questions:
             query = question["question"]
+            ground_truths = question["sources"]
 
-            source = question["sources"][0]
+            results = self.fusion(query, top_k)
 
-            file_path = source["file_path"]
-            gt_range = (
-                source["first_character_index"],
-                source["last_character_index"],
-            )
-
-            self.search(query, top_k=top_k)
-
-            matching = [
-                chunk
-                for chunk in self.last_results
-                if chunk.source.file_path == file_path
+            retrieved_chunks = [
+                self.chunks[chunk_id]
+                for chunk_id, score in results
             ]
 
             question_passed = False
-            best_iou = 0.0
 
-            for chunk in matching:
-                chunk_range = (
-                    chunk.source.first_character_index,
-                    chunk.source.last_character_index,
-                )
+            for chunk in retrieved_chunks:
+                for ground_truth in ground_truths:
+                    overlap = self.source_overlap(
+                        chunk.source,
+                        ground_truth
+                    )
 
-                iou = compute_iou(chunk_range, gt_range)
-                best_iou = max(best_iou, iou)
+                    if overlap >= 0.05:
+                        question_passed = True
+                        break
 
-                if iou >= threshold:
-                    question_passed = True
+                if question_passed:
                     break
 
             if question_passed:
                 passed += 1
 
-            status = "PASS" if question_passed else "FAIL"
-
             print(
-                f"[{number}/{len(questions)}] "
-                f"{status} | IoU: {best_iou:.4f} | "
-                f"{query}"
+                f"{'PASS' if question_passed else 'FAIL'} "
+                f"| {question['question_id']} "
+                f"| {query}"
             )
 
         total = len(questions)
-        pass_rate = passed / total * 100 if total else 0
 
-        print("\n" + "=" * 60)
-        print("FINAL RESULTS")
-        print("=" * 60)
-        print(f"Total questions : {total}")
-        print(f"Passed          : {passed}")
-        print(f"Failed          : {total - passed}")
-        print(f"Pass rate       : {pass_rate:.2f}%")
+        if total > 0:
+            score = passed / total * 100
+            print(f"\nRecall@{top_k}: {score:.2f}%")
