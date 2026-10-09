@@ -66,11 +66,8 @@ class Python():
 
     def split_toplvl(self):
         chunks = []
-        i = 0
         
         for file in self.python_files:
-            print(f"Processing file {i}: {file}")
-            i += 1
             
             content = self._get_file_content(file)
             if not content.strip():
@@ -140,7 +137,6 @@ class Python():
 
     def split_internals(self):
         updated_chunks = []
-        print(f"Splitting internals for {len(self.chunks)} chunks...")
         
         for chunk in self.chunks:
             if len(chunk['text']) <= self.max_size or not hasattr(

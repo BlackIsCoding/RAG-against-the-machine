@@ -48,5 +48,4 @@ class Ingester:
 
         with open(output, 'w') as f:
             json.dump(serialized_data, f, indent=4)
-            print("donneee")
         return wrapped_chunks[1]

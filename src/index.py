@@ -9,7 +9,7 @@ class Indexer():
     def __init__(self, chunks: list[Chunk]):
         self.chunks = chunks
         self.saving_path = Path("data/processed/")
-        self.model = sentence_transformers.SentenceTransformer("all-MiniLM-L6-v2")
+        # self.model = sentence_transformers.SentenceTransformer("all-MiniLM-L6-v2")
 
     def encode_chunks(self):
         gather = []
@@ -46,7 +46,6 @@ class Indexer():
         print(f"Tokenizing {len(texts)} chunks...")
         stemmer = Stemmer.Stemmer("english")
         corpus_tokens = bm25s.tokenize(texts, stemmer=stemmer)
-        print(f"{type(corpus_tokens)} -> {corpus_tokens}")
         retriever = bm25s.BM25()
         retriever.index(corpus_tokens)
         self.saving_path.mkdir(parents=True, exist_ok=True)
