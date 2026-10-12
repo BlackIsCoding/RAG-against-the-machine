@@ -68,16 +68,19 @@ class Indexer():
         print("Corpus changed, rebuilding index.")
 
 
-        for chunk in self.chunks:
-            text = ''
-            for i, m in enumerate(chunk.metadata):
-                if i != 0:
-                    text += ' ' + m
-                else:
-                    text += m
-            chunk.text = text + '\n' + chunk.text
+        # for chunk in self.chunks:
+        #     text = ''
+        #     for i, m in enumerate(chunk.metadata):
+        #         if i != 0:
+        #             text += ' ' + m
+        #         else:
+        #             text += m
+        #     chunk.text = text + '\n' + chunk.text
 
-        texts = [chunk.text for chunk in self.chunks] # the chunks text in order
+        # texts = [chunk.text for chunk in self.chunks]
+        #  # the chunks text in order
+
+        texts = self.chunks
         print(f"Tokenizing {len(texts)} chunks...")
         stemmer = Stemmer.Stemmer("english")
         corpus_tokens = bm25s.tokenize(texts, stemmer=stemmer)
@@ -179,23 +182,38 @@ class Indexer():
 
 
 chunks = [
-    "vLLM uses abb PagedAttention to efficiently manage GPU memory.",
-    "Berserk is a manga",
-    "Berserk cry baby",
-    "rat is Jerry",
+    "Jerry is good",
+    "eating  is good",
+    "vehicule is good"
     "The scheduler manages requests waiting to be executed.",
-    "vLLM supports continuous batching for efficient inference.",
     "The tokenizer converts text into tokens before inference.",
     "Python is a programming language used for machine learning.",
 ]
 
-queries = ["what is cat", "Berserk manga?"]
+# Use a string query instead of iterating over characters
+query = "Tom crazy"
+top_k = 3
 
 indexer = Indexer(chunks)
 indexer.bm25s_indexing()
 indexer.encode_chunks()
-for q in queries:
-    top = indexer.fusion(q, 3)
 
-    for t in top:
-        print(f"with score of {t[1]} | {chunks[t[0]]}")
+print(f"\nQuery: '{query}'\n" + "="*50)
+
+# 1. Lexical Search Alone (BM25)
+print("\n--- 1. Lexical Search (BM25) ---")
+lex_indices, lex_scores = indexer.lexical_search(query, top_k=top_k)
+for idx, score in zip(lex_indices, lex_scores):
+    print(f"Score: {score:.4f} | {chunks[idx]}")
+
+# 2. Semantic Search Alone
+print("\n--- 2. Semantic Search ---")
+sem_indices, sem_scores = indexer.semantic_search(query, top_k=top_k)
+for idx, score in zip(sem_indices, sem_scores):
+    print(f"Score: {score:.4f} | {chunks[idx]}")
+
+# 3. Hybrid Search (Fusion)
+print("\n--- 3. Hybrid Search (Fusion) ---")
+hybrid_results = indexer.fusion(query, top_k=top_k)
+for chunk_id, score in hybrid_results:
+    print(f"Score: {score:.4f} | {chunks[chunk_id]}")
