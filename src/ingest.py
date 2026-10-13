@@ -40,12 +40,17 @@ class Ingester:
                 
             return (wrapped_chunks, with_text)
 
-    def saving_chunks(self, chunks, output: str = "data/processed/chunks/all_chunks.json"):
-        out_file = Path(output)
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-        wrapped_chunks = self.wrapping_chunks(chunks)
-        serialized_data = [chunk.model_dump() for chunk in wrapped_chunks[0]]
 
-        with open(output, 'w') as f:
-            json.dump(serialized_data, f, indent=4)
-        return wrapped_chunks[1]
+    def saving_chunks(self, chunks, output: str = "data/processed/chunks/all_chunks.json"):
+            out_file = Path(output)
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            wrapped_chunks, with_text = self.wrapping_chunks(chunks)
+            
+            # Serialize the full chunks (with_text) that include content, metadata, and source info
+            serialized_data = [chunk.model_dump() for chunk in with_text]
+
+            with open(output, 'w', encoding='utf-8') as f:
+                json.dump(serialized_data, f, indent=4, ensure_ascii=False)
+                
+            return with_text

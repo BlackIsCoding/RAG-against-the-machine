@@ -1,233 +1,312 @@
-from __future__ import annotations
-try:
-    from .ingest import Ingester
-    from .index import Indexer
-    from .markdown import Header
-    from .chunking_pyy import Python
-    from .pyd_models import MinimalSearchResults, MinimalSource, StudentSearchResults
-    import json
-    import fire
-    import time
-    import pathlib
-except Exception as e:
-    print("Module level:", e)
-    exit(1)
+"""Command-line interface for the RAG pipeline (run: python -m src <cmd>)."""
+import functools
+import sys
+from pathlib import Path
+from typing import Any, Callable
+
+import fire  # type: ignore
+from tqdm import tqdm
+
+from .markdown import Header
+from .chunking_pyy import Python  # ADAPT to your chunker
+from .index import Indexer
+from .ingest import Ingester
+from .pyd_models import (
+    AnsweredQuestion,
+    Chunk,
+    MinimalAnswer,
+    MinimalSearchResults,
+    MinimalSource,
+    RagDataset,
+    StudentSearchResults,
+    StudentSearchResultsAndAnswer,
+)
+
+RAW_DIR: str = "data/raw"
+PROCESSED_DIR: str = "data/processed"
+MAX_CHUNK_LIMIT: int = 2000
+IOU_THRESHOLD: float = 0.05
+RECALL_KS: tuple[int, ...] = (1, 3, 5, 10)
+MODEL_NAME: str = "Qwen/Qwen3-0.6B"
+MAX_CONTEXT_CHARS: int = 8000
+
+_MODEL_CACHE: dict[str, Any] = {}
 
 
-def index(max_chunk_size = 2000):
-    ingester = Ingester("data/raw/vllm-0.10.1")
-    md = ingester.find_txt_files()
-    md += ingester.find_md_files()
-    
-    md_parser = Header(md, max_chunk_size)
-
-    chunks = md_parser.split()
-    chunks = md_parser.split_para()
-    chunks = md_parser.split_lines()
-    chunks = md_parser.split_sentence()
-
-    py_files = ingester.find_python_files()
-    
-    py_parser = Python(py_files, max_chunk_size)
-    py_parser.split_toplvl()
-    py_parser.merge_toplvl()
-    py_parser.split_internals()
-    py_parser.split_lines()
-    py_parser.split_sentence()
-    chunks += py_parser.chunks_adapt()
-
-            
-    objected_chunks = ingester.saving_chunks(chunks)
-
-    indexer = Indexer(objected_chunks)
-    indexer.bm25s_indexing()
-    
-    # start = time.perf_counter()
-    # indexer.encode_chunks()
-    # print("encoding chunks:", time.perf_counter() - start)
-
-    # if not query:
-    #     with open("data/datasets/public/AnsweredQuestions/dataset_docs_public.json") as f:
-    #         questions = json.load(f)
-    #     indexer.evaluate_dataset(questions['rag_questions'], 5)
-    #     with open("data/datasets/public/AnsweredQuestions/dataset_code_public.json") as f:
-    #         questions = json.load(f)
-    #     indexer.evaluate_dataset(questions['rag_questions'], 5)
-    # else:
-    #     indexer.fusion(query, 5)
-
-def search(query='', k=5):
-    index = Indexer(None)
-
-    if query:
-        results, _ = index.lexical_search(query, k)
-        with open("data/processed/chunks/all_chunks.json") as f:
-            chunks = json.load(f)
-        for r in results:
-            chunk = chunks[r]
-            first = chunk['first_character_index']
-            last = chunk['last_character_index']
-            print(f"{chunk['file_path']} [{first}:{last}]")
-
-def search_dataset(dataset_path, k, save_directory):
-    path = pathlib.Path(dataset_path)
-    if not path.exists():
-        print(f"Error: Dataset not found at {dataset_path}")
-        return
-
-    # 1. Load the question dataset
-    with open(path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    questions = data.get("rag_questions", [])
-    if not questions:
-        print("Error: No questions found in the dataset.")
-        return
-
-    saving_path = pathlib.Path("data/processed")
-    if not saving_path.exists():
-        print("Error: Index not found. Please run 'index' first.")
-        return
-
-    with open("data/processed/chunks/all_chunks.json") as f:
-        chunks = json.load(f)
-
-    index = Indexer(None)
-    min_search_result_list = []
-    for question in questions:
-        q_id = question['question_id']
-        q_text = question['question']
+def _safe(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Turn any exception into a clean error message (no traceback)."""
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return None
+    return wrapper
 
 
-        results, _ = index.lexical_search(q_text, k)
+def _load_index(processed_dir: str) -> tuple[Indexer, list[MinimalSource]]:
+    """Load the saved sources and an Indexer pointing at the saved index."""
+    chunks_file: Path = Path(processed_dir) / "chunks" / "all_chunks.json"
+    if not chunks_file.exists():
+        raise FileNotFoundError(
+            f"{chunks_file} not found, run the `index` command first"
+        )
+    sources: list[MinimalSource] = [
+        MinimalSource.model_validate(item)
+        for item in __import__("json").loads(
+            chunks_file.read_text(encoding="utf-8")
+        )
+    ]
+    indexer: Indexer = Indexer([])
+    indexer.saving_path = Path(processed_dir)
+    return indexer, sources
 
-        minimal_list = []
 
-        for r in results:
-            chunk = chunks[r]
-            
-            source = MinimalSource(
-                file_path = str(chunk['file_path']),
-                first_character_index = chunk['first_character_index'],
-                last_character_index = chunk['last_character_index'])
-            
-            minimal_list.append(source)
-        
-        
-        min_search_result = MinimalSearchResults(
-                question_id=q_id,
-                question=q_text,
-                retrieved_sources=minimal_list
-            )
-        min_search_result_list.append(min_search_result)
+def _retrieve(indexer: Indexer, sources: list[MinimalSource],
+              query: str, k: int) -> list[MinimalSource]:
+    """Return the top-k sources for one query."""
+    ids, _scores = indexer.lexical_search(query, top_k=k)
+    return [sources[int(i)] for i in ids if int(i) < len(sources)]
 
-    student_results = StudentSearchResults(
-        search_results=min_search_result_list,
-        k=k
+
+def _check_query(query: Any, k: int) -> str:
+    """Validate a single query and k, return the cleaned query."""
+    cleaned: str = str(query).strip()
+    if not cleaned:
+        raise ValueError("the query is empty")
+    if k <= 0:
+        raise ValueError("k must be greater than 0")
+    return cleaned
+
+
+def _read_span(source: MinimalSource) -> str:
+    """Read the text covered by a source from disk."""
+    try:
+        text: str = Path(source.file_path).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return ""
+    return text[source.first_character_index:source.last_character_index]
+
+
+def _generate(question: str, sources: list[MinimalSource]) -> str:
+    """Answer a question from the retrieved sources with Qwen3-0.6B."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if "model" not in _MODEL_CACHE:
+        _MODEL_CACHE["tokenizer"] = AutoTokenizer.from_pretrained(MODEL_NAME)
+        _MODEL_CACHE["model"] = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME, torch_dtype="auto"
+        )
+    tokenizer: Any = _MODEL_CACHE["tokenizer"]
+    model: Any = _MODEL_CACHE["model"]
+
+    context: str = ""
+    for source in sources:
+        piece: str = f"[{source.file_path}]\n{_read_span(source)}\n\n"
+        if len(context) + len(piece) > MAX_CONTEXT_CHARS:
+            break
+        context += piece
+
+    messages: list[dict[str, str]] = [
+        {"role": "system",
+         "content": "Answer the question using only the provided context. "
+                    "If the context does not contain the answer, say so. "
+                    "Be concise."},
+        {"role": "user",
+         "content": f"Context:\n{context}\nQuestion: {question}"},
+    ]
+    prompt: str = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
     )
-
-    save_dir = pathlib.Path(save_directory)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    output_file = save_dir / path.name
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(student_results.model_dump(), f, indent=4)
-
-    print(f"Saved student_search_results to {output_file}")
-
-
-
-def evaluate(student_search_results_path: str, dataset_path: str) -> None:
-    """Report recall@k using IoU overlap with ground-truth sources."""
-    student_path = pathlib.Path(student_search_results_path)
-    gt_path = pathlib.Path(dataset_path)
-
-    if not student_path.exists() or not gt_path.exists():
-        print("Error: Path does not exist.")
-        return
-
-    with open(student_path, "r", encoding="utf-8") as f:
-        student_data = json.load(f)
-
-    with open(gt_path, "r", encoding="utf-8") as f:
-        gt_data = json.load(f)
-
-    student_results_dict = {
-        item["question_id"]: item
-        for item in student_data.get("search_results", [])
-    }
-    gt_questions = gt_data.get("rag_questions", [])
-
-    k_values = [1, 3, 5, 10]
-    recall_counts = {k: 0 for k in k_values}
-    total_evaluated = 0
-
-    for gt_q in gt_questions:
-        q_id = gt_q.get("question_id")
-        gt_sources = gt_q.get("sources", [])
-
-        if not gt_sources or q_id not in student_results_dict:
-            continue
-
-        total_evaluated += 1
-        student_sources = student_results_dict[q_id].get(
-            "retrieved_sources", []
+    inputs: Any = tokenizer(prompt, return_tensors="pt")
+    with torch.no_grad():
+        output: Any = model.generate(
+            **inputs, max_new_tokens=256, do_sample=False
         )
+    new_tokens: Any = output[0][inputs["input_ids"].shape[1]:]
+    return str(tokenizer.decode(new_tokens, skip_special_tokens=True)).strip()
 
-        for k in k_values:
-            top_k = student_sources[:k]
-            found = False
 
-            for gt_src in gt_sources:
-                gt_file = gt_src["file_path"]
-                gt_start = gt_src["first_character_index"]
-                gt_end = gt_src["last_character_index"]
+class Cli:
+    """RAG against the machine: index, search, answer, evaluate."""
 
-                for st_src in top_k:
-                    if gt_file != st_src["file_path"]:
-                        continue
+    @_safe
+    def index(self, max_chunk_size: int = MAX_CHUNK_LIMIT,
+              raw_dir: str = RAW_DIR,
+              processed_dir: str = PROCESSED_DIR) -> None:
+        """Chunk data/raw and build the BM25 index under data/processed."""
+        if max_chunk_size <= 0:
+            raise ValueError("max_chunk_size must be greater than 0")
+        if max_chunk_size > MAX_CHUNK_LIMIT:
+            print(f"max_chunk_size capped to {MAX_CHUNK_LIMIT}")
+            max_chunk_size = MAX_CHUNK_LIMIT
 
-                    st_start = st_src["first_character_index"]
-                    st_end = st_src["last_character_index"]
-
-                    # Intersection
-                    inter_start = max(gt_start, st_start)
-                    inter_end = min(gt_end, st_end)
-                    intersection = max(0, inter_end - inter_start)
-
-                    # Union = GT length + chunk length - intersection
-                    gt_len = max(0, gt_end - gt_start)
-                    st_len = max(0, st_end - st_start)
-                    union = gt_len + st_len - intersection
-
-                    iou = intersection / union if union > 0 else 0.0
-
-                    # One qualifying chunk is enough to pass this recall@k
-                    if iou >= 0.05:
-                        found = True
-                        break
-
-                if found:
-                    break
-
-            if found:
-                recall_counts[k] += 1
-
-    print(f"Total evaluated questions: {total_evaluated}")
-    print("Evaluation Results (IoU >= 0.05):")
-
-    for k in k_values:
-        score = (
-            recall_counts[k] / total_evaluated
-            if total_evaluated > 0
-            else 0.0
+        ingester: Ingester = Ingester(raw_dir)
+        files: list[Path] = (
+            ingester.find_python_files()
+            + ingester.find_md_files()
+            + ingester.find_txt_files()
         )
-        print(
-            f"Recall@{k}: {score:.3f} ({score * 100:.1f}%)"
+        if not files:
+            raise FileNotFoundError(f"no .py/.md/.txt files under {raw_dir}")
+
+        all_chunks: list[dict[str, Any]] = []
+        for path in tqdm(files, desc="Chunking", unit="file"):
+            chunker: Callable[[Path, int], list[dict[str, Any]]] = (
+                chunk_python if path.suffix == ".py" else chunk_markdown
+            )
+            all_chunks.extend(chunker(path, max_chunk_size))
+
+        too_long: int = sum(
+            1 for c in all_chunks
+            if c["end_char"] - c["start_char"] > max_chunk_size
         )
+        if too_long:
+            print(f"Warning: {too_long} chunks exceed {max_chunk_size} chars")
+
+        chunks_file: Path = Path(processed_dir) / "chunks" / "all_chunks.json"
+        chunks: list[Chunk] = ingester.saving_chunks(
+            all_chunks, output=str(chunks_file)
+        )
+        indexer: Indexer = Indexer(chunks)
+        indexer.saving_path = Path(processed_dir)
+        indexer.bm25s_indexing()
+        print(f"Ingestion complete! Indexed {len(chunks)} chunks "
+              f"under {processed_dir}/")
+
+    @_safe
+    def search(self, query: str, k: int = 10,
+               processed_dir: str = PROCESSED_DIR) -> None:
+        """Print the top-k sources for a single query."""
+        cleaned: str = _check_query(query, k)
+        indexer, sources = _load_index(processed_dir)
+        for src in _retrieve(indexer, sources, cleaned, k):
+            print(f"{src.file_path} "
+                  f"[{src.first_character_index}:{src.last_character_index}]")
+
+    @_safe
+    def search_dataset(self, dataset_path: str, k: int = 10,
+                       save_directory: str = "data/output/search_results",
+                       processed_dir: str = PROCESSED_DIR) -> None:
+        """Run search over a dataset and save a StudentSearchResults JSON."""
+        if k <= 0:
+            raise ValueError("k must be greater than 0")
+        dataset: RagDataset = RagDataset.model_validate_json(
+            Path(dataset_path).read_text(encoding="utf-8")
+        )
+        indexer, sources = _load_index(processed_dir)
+
+        results: list[MinimalSearchResults] = []
+        for question in tqdm(dataset.rag_questions, desc="Searching",
+                             unit="question"):
+            found: list[MinimalSource] = (
+                _retrieve(indexer, sources, question.question, k)
+                if question.question.strip() else []
+            )
+            results.append(MinimalSearchResults(
+                question_id=question.question_id,
+                question=question.question,
+                retrieved_sources=found,
+            ))
+
+        output: StudentSearchResults = StudentSearchResults(
+            search_results=results, k=k
+        )
+        out_file: Path = Path(save_directory) / Path(dataset_path).name
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        out_file.write_text(output.model_dump_json(indent=2),
+                            encoding="utf-8")
+        print(f"Saved student_search_results to {out_file}")
+
+    @_safe
+    def answer(self, query: str, k: int = 5,
+               processed_dir: str = PROCESSED_DIR) -> None:
+        """Retrieve for one query and generate an answer."""
+        cleaned: str = _check_query(query, k)
+        indexer, sources = _load_index(processed_dir)
+        found: list[MinimalSource] = _retrieve(indexer, sources, cleaned, k)
+        print(_generate(cleaned, found))
+
+    @_safe
+    def answer_dataset(self, student_search_results_path: str,
+                       save_directory: str = (
+                           "data/output/search_results_and_answer"),
+                       ) -> None:
+        """Generate answers from saved search results."""
+        student: StudentSearchResults = (
+            StudentSearchResults.model_validate_json(
+                Path(student_search_results_path).read_text(encoding="utf-8")
+            )
+        )
+        answers: list[MinimalAnswer] = []
+        for res in tqdm(student.search_results, desc="Answering",
+                        unit="question"):
+            text: str = (
+                _generate(res.question, res.retrieved_sources)
+                if res.question.strip() else ""
+            )
+            answers.append(MinimalAnswer(
+                question_id=res.question_id,
+                question=res.question,
+                retrieved_sources=res.retrieved_sources,
+                answer=text,
+            ))
+
+        output: StudentSearchResultsAndAnswer = StudentSearchResultsAndAnswer(
+            search_results=answers, k=student.k
+        )
+        out_file: Path = (
+            Path(save_directory) / Path(student_search_results_path).name
+        )
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        out_file.write_text(output.model_dump_json(indent=2),
+                            encoding="utf-8")
+        print(f"Saved student_search_results_and_answer to {out_file}")
+
+    @_safe
+    def evaluate(self, student_search_results_path: str,
+                 dataset_path: str) -> None:
+        """Print recall@k against a ground-truth (answered) dataset."""
+        student: StudentSearchResults = (
+            StudentSearchResults.model_validate_json(
+                Path(student_search_results_path).read_text(encoding="utf-8")
+            )
+        )
+        truth: RagDataset = RagDataset.model_validate_json(
+            Path(dataset_path).read_text(encoding="utf-8")
+        )
+        truth_by_id: dict[str, AnsweredQuestion] = {
+            q.question_id: q for q in truth.rag_questions
+            if isinstance(q, AnsweredQuestion)
+        }
+        overlap: Indexer = Indexer([])
+
+        print("Student data is valid: True")
+        for k_val in RECALL_KS:
+            if k_val > student.k:
+                continue
+            total: float = 0.0
+            counted: int = 0
+            for res in student.search_results:
+                gt: AnsweredQuestion | None = truth_by_id.get(res.question_id)
+                if gt is None or not gt.sources:
+                    continue
+                top: list[MinimalSource] = res.retrieved_sources[:k_val]
+                hits: int = sum(
+                    1 for g in gt.sources
+                    if any(overlap.source_overlap(r, g.model_dump())
+                           >= IOU_THRESHOLD for r in top)
+                )
+                total += hits / len(gt.sources)
+                counted += 1
+            if counted:
+                print(f"Recall@{k_val}: {total / counted:.3f}")
 
 
-
-fire.Fire({"index": index, "search": search,
-           "search_dataset": search_dataset,
-           "evaluate": evaluate})
+if __name__ == "__main__":
+    fire.Fire(Cli)

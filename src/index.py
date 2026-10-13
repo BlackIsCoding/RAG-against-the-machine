@@ -4,6 +4,8 @@ import Stemmer
 import bm25s
 import sentence_transformers
 import numpy as np
+import math
+import json
 
 class Indexer():
     def __init__(self, chunks: list[Chunk]):
@@ -32,7 +34,82 @@ class Indexer():
 
         self.encoded_chunks = np.array(gather)
 
+    def tokenize_chunks(self, chunks, query):
+        en_stem = Stemmer.Stemmer("english")
+        tokenized = bm25s.tokenize(chunks, stemmer=en_stem)
+        query = bm25s.tokenize([query], stemmer=en_stem)
+
+        vocab = tokenized.vocab
+        query_tokens = [
+            vocab[token]
+            for token in query.vocab
+            if token in vocab
+        ]
+        encoded_chunks = tokenized.ids
+
+        return query_tokens, encoded_chunks
+
+    def build_tf(self, query, chunks):
+        chunks_infos = []
+        for chunk in chunks:
+            tf_dict = {}
+            for token in query:
+                tf = chunk.count(token)
+                if not tf:
+                    continue
+                tf_dict[token] = tf
+
+            chunks_infos.append((chunk, tf_dict))
+        return chunks_infos
+
+    def build_df(self, query, chunks):
+        df_dict = {}
+
+        for token in query:
+            df = sum(token in chunk for chunk in chunks)
+            df_dict[token] = df
+        return df_dict
+            
+    def build_idf(self, query, df_dict, chunks):
+        idf_dict = {}
+        n = len(chunks)
+        for token in query:
+            df = df_dict[token]
+            idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
+            idf_dict[token] = idf
+        return idf_dict
+
+    def average_lenght(self, chunks):
+        lenght = 0
+        for chunk in chunks:
+            lenght += len(chunk)
+        avgdl = lenght / len(chunks) if len(chunks) else 0
+        return len(chunks), avgdl
+
+    def bm25_score(self, tf_dict, idf_dict, dl, avgdl, k1=1.5, b=0.75):
+        bm25_score = 0
+        for token , tf in tf_dict.items():
+            numerator = tf * (k1 + 1)
+            denominator = tf + k1 * (1 - b + b * dl /avgdl)
+            score = idf_dict[token] * numerator / denominator
+            bm25_score += score
+        return bm25_score
+
+    def score_chunks(self, chunks_tf, chunk_tokens, idf_dict, avgdl, k1=1.5, b=0.75):
+        scores = {}
+
+        for i, (chunk, tf_dict) in enumerate(chunks_tf):
+            dl = len(chunk_tokens[i])
+            score = self.bm25_score(tf_dict, idf_dict, dl, avgdl, k1, b)
+            scores[i] = score
+        return scores
+
+    def return_topk(self, scores, top_k):
+        return sorted(scores, key=scores.get, reverse=True)[:top_k]
+
     def bm25s_indexing(self):
+        self.saving_path.mkdir(parents=True, exist_ok=True)
+
         for chunk in self.chunks:
             text = ''
             for i, m in enumerate(chunk.metadata):
@@ -42,15 +119,21 @@ class Indexer():
                     text += m
             chunk.text = text + '\n' + chunk.text
 
-        texts = [chunk.text for chunk in self.chunks] # the chunks text in order
+        texts = [chunk.text for chunk in self.chunks]
         print(f"Tokenizing {len(texts)} chunks...")
         stemmer = Stemmer.Stemmer("english")
-        corpus_tokens = bm25s.tokenize(texts, stemmer=stemmer)
-        retriever = bm25s.BM25()
-        retriever.index(corpus_tokens)
-        self.saving_path.mkdir(parents=True, exist_ok=True)
-        retriever.save(self.saving_path)
-        print(f"BM25 index successfully built and saved to {self.saving_path}")
+        tokenized_corpus = bm25s.tokenize(texts, stemmer=stemmer)
+
+        index_data = {
+            "tokenized_ids": [list(arr) for arr in tokenized_corpus.ids],
+            "vocab": tokenized_corpus.vocab
+        }
+
+        index_file = self.saving_path / "custom_bm25_index.json"
+        with open(index_file, "w", encoding="utf-8") as f:
+            json.dump(index_data, f, ensure_ascii=False)
+
+        print(f"Custom BM25 index successfully built and saved to {index_file}")
 
     def semantic_search(self, query, top_k):
         model = self.model
@@ -60,17 +143,43 @@ class Indexer():
         return top_results, similarity[top_results]
 
     def lexical_search(self, query: str, top_k: int = 5):
-        """Load the BM25 index, query it, and map row IDs back to your in-memory chunks."""
-        if not self.saving_path.exists():
-            raise FileNotFoundError(f"Index not found at {self.saving_path}. Run 'index' first!")
+            """Load the custom BM25 index from JSON, query it, and return top results."""
+            index_file = self.saving_path / "custom_bm25_index.json"
+            
+            # Enforce that the pre-built index must exist
+            if not index_file.exists():
+                raise FileNotFoundError(
+                    f"Custom BM25 index not found at {index_file}. Please run indexing first."
+                )
 
-        retriever = bm25s.BM25.load(str(self.saving_path), load_corpus=False)
-        stemmer = Stemmer.Stemmer("english")
-        query_tokens = bm25s.tokenize([query], stemmer=stemmer)
-        results, scores = retriever.retrieve(query_tokens, k=top_k)
-        results = results[0]
-        scores = scores[0]
-        return results, scores
+            with open(index_file, "r", encoding="utf-8") as f:
+                saved_index = json.load(f)
+                en_chunks = saved_index["tokenized_ids"]
+
+            # Allow self.chunks to be None by using a safe fallback length matching the saved index
+            if self.chunks:
+                chunks_text = [chunk.text for chunk in self.chunks]
+            else:
+                chunks_text = [""] * len(en_chunks)
+
+            query_tokens, _ = self.tokenize_chunks(chunks_text, query)
+
+            if not query_tokens:
+                return np.array([]), np.array([])
+
+            chunks_tf = self.build_tf(query_tokens, en_chunks)
+            df_dict = self.build_df(query_tokens, en_chunks)
+            idf_dict = self.build_idf(query_tokens, df_dict, en_chunks)
+            _, avgdl = self.average_lenght(en_chunks)
+
+            scores = self.score_chunks(chunks_tf, en_chunks, idf_dict, avgdl)
+            
+            sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+            results = np.array([item[0] for item in sorted_scores])
+            retrieved_scores = np.array([item[1] for item in sorted_scores])
+
+            return results, retrieved_scores
 
     def rescale_vectors(self, scores):
         scores = np.array(scores)
